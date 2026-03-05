@@ -1,0 +1,33 @@
+---
+- name: Health check for deployed application
+  hosts: webservers
+  gather_facts: no
+  vars:
+    health_check_port: "{{ app_port | default(8000) }}"
+
+  tasks:
+    - name: Check application health endpoint
+      uri:
+        url: "http://localhost:{{ health_check_port }}/health"
+        method: GET
+        status_code: 200
+      register: health_result
+      tags: health
+
+    - name: Check Docker service status
+      systemd:
+        name: docker
+        enabled: yes
+      check_mode: yes
+      register: docker_status
+      tags: health
+
+    - name: Display health status
+      debug:
+        msg: |
+          ========== HEALTH CHECK RESULTS ==========
+          Application Health: {{ health_result.status }}
+          Health URL: http://localhost:{{ health_check_port }}/health
+          Docker Service: {{ docker_status.changed | ternary('needs restart', 'healthy') }}
+          ==========================================
+      tags: health

@@ -1,0 +1,21 @@
+---
+- name: Provision infrastructure only (no app deployment)
+  hosts: webservers
+  become: yes
+  gather_facts: yes
+
+  roles:
+    - role: common
+      tags:
+        - common
+    - role: docker
+      tags:
+        - docker
+
+  post_tasks:
+    - name: Display provisioning summary
+      debug:
+        msg: |
+          System provisioning complete!
+          Docker service status: {{ docker_service_state }}
+      tags: always

@@ -2,19 +2,95 @@
 DevOps Info Service
 Main application module
 """
+import json
 import os
 import socket
 import platform
 import logging
+import sys
+from time import perf_counter
 from datetime import datetime, timezone
-from flask import Flask, jsonify, request
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+from flask import Flask, Response, jsonify, request
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
 )
-logger = logging.getLogger(__name__)
+
+
+def format_timestamp(timestamp: datetime | None = None) -> str:
+    """Return a UTC timestamp in ISO-8601 format."""
+    value = timestamp or datetime.now(timezone.utc)
+    return value.isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+
+
+class JSONFormatter(logging.Formatter):
+    """Format logs as JSON for log aggregation systems."""
+
+    default_attrs = {
+        'args',
+        'asctime',
+        'created',
+        'exc_info',
+        'exc_text',
+        'filename',
+        'funcName',
+        'levelname',
+        'levelno',
+        'lineno',
+        'module',
+        'msecs',
+        'message',
+        'msg',
+        'name',
+        'pathname',
+        'process',
+        'processName',
+        'relativeCreated',
+        'stack_info',
+        'taskName',
+        'thread',
+        'threadName',
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            'timestamp': format_timestamp(
+                datetime.fromtimestamp(record.created, tz=timezone.utc),
+            ),
+            'level': record.levelname,
+            'logger': record.name,
+            'message': record.getMessage(),
+        }
+
+        if record.exc_info:
+            payload['exception'] = self.formatException(record.exc_info)
+
+        for key, value in record.__dict__.items():
+            if key in self.default_attrs:
+                continue
+            payload[key] = value
+
+        return json.dumps(payload, ensure_ascii=False)
+
+
+def configure_logging() -> logging.Logger:
+    """Configure application-wide JSON logging to stdout."""
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.setLevel(logging.INFO)
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(JSONFormatter())
+    root_logger.addHandler(stream_handler)
+    logging.getLogger('werkzeug').setLevel(logging.WARNING)
+
+    return logging.getLogger('devops-info-service')
+
+
+logger = configure_logging()
 
 app = Flask(__name__)
 
@@ -25,6 +101,43 @@ DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
 
 # Application start time
 START_TIME = datetime.now(timezone.utc)
+
+# Known endpoints are exposed as-is; unknown paths are grouped to keep
+# label values low-cardinality.
+KNOWN_ENDPOINTS = {'/', '/health', '/metrics', '/boom'}
+
+# RED metrics for HTTP traffic.
+HTTP_REQUESTS_TOTAL = Counter(
+    'http_requests_total',
+    'Total HTTP requests processed',
+    ['method', 'endpoint', 'status_code'],
+)
+HTTP_REQUEST_DURATION_SECONDS = Histogram(
+    'http_request_duration_seconds',
+    'HTTP request duration in seconds',
+    ['method', 'endpoint', 'status_code'],
+)
+HTTP_REQUESTS_IN_PROGRESS = Gauge(
+    'http_requests_in_progress',
+    'HTTP requests currently being processed',
+    ['method', 'endpoint'],
+)
+
+# Application-specific business metrics.
+ENDPOINT_CALLS_TOTAL = Counter(
+    'devops_info_endpoint_calls_total',
+    'Total calls to service endpoints',
+    ['endpoint'],
+)
+SYSTEM_INFO_COLLECTION_SECONDS = Histogram(
+    'devops_info_system_info_collection_seconds',
+    'Time spent collecting system information',
+)
+
+
+def normalize_endpoint(path: str) -> str:
+    """Normalize unknown paths so label values do not explode."""
+    return path if path in KNOWN_ENDPOINTS else '/other'
 
 
 def get_uptime():
@@ -42,14 +155,15 @@ def get_uptime():
 
 def get_system_info():
     """Collect system information."""
-    return {
-        'hostname': socket.gethostname(),
-        'platform': platform.system(),
-        'platform_version': platform.platform(),
-        'architecture': platform.machine(),
-        'cpu_count': os.cpu_count() or 0,
-        'python_version': platform.python_version()
-    }
+    with SYSTEM_INFO_COLLECTION_SECONDS.time():
+        return {
+            'hostname': socket.gethostname(),
+            'platform': platform.system(),
+            'platform_version': platform.platform(),
+            'architecture': platform.machine(),
+            'cpu_count': os.cpu_count() or 0,
+            'python_version': platform.python_version(),
+        }
 
 
 def get_service_info():
@@ -80,28 +194,97 @@ def get_runtime_info():
 
 def get_request_info():
     """Get current request information."""
-    client_ip = request.remote_addr or request.environ.get(
-        'HTTP_X_FORWARDED_FOR',
-        'unknown',
-    )
     return {
-        'client_ip': client_ip,
+        'client_ip': get_client_ip(),
         'user_agent': request.headers.get('User-Agent', 'unknown'),
         'method': request.method,
         'path': request.path,
     }
 
 
+def get_client_ip() -> str:
+    """Extract client IP address with proxy awareness."""
+    forwarded_for = request.headers.get('X-Forwarded-For', '')
+    if forwarded_for:
+        return forwarded_for.split(',')[0].strip()
+
+    return request.remote_addr or 'unknown'
+
+
+@app.before_request
+def log_request_started():
+    """Log incoming HTTP requests before handlers execute."""
+    request.start_time = perf_counter()
+    request.metric_endpoint = normalize_endpoint(request.path)
+    if request.path != '/metrics':
+        HTTP_REQUESTS_IN_PROGRESS.labels(
+            method=request.method,
+            endpoint=request.metric_endpoint,
+        ).inc()
+    logger.info(
+        'request_started',
+        extra={
+            'method': request.method,
+            'path': request.path,
+            'client_ip': get_client_ip(),
+            'user_agent': request.headers.get('User-Agent', 'unknown'),
+        },
+    )
+
+
+@app.after_request
+def log_request_completed(response):
+    """Log request completion status and execution time."""
+    start_time = getattr(request, 'start_time', perf_counter())
+    endpoint = getattr(
+        request,
+        'metric_endpoint',
+        normalize_endpoint(request.path),
+    )
+    duration_seconds = perf_counter() - start_time
+    duration_ms = int(duration_seconds * 1000)
+
+    level = logging.INFO
+    if response.status_code >= 500:
+        level = logging.ERROR
+    elif response.status_code >= 400:
+        level = logging.WARNING
+
+    logger.log(
+        level,
+        'request_completed',
+        extra={
+            'method': request.method,
+            'path': request.path,
+            'status_code': response.status_code,
+            'client_ip': get_client_ip(),
+            'duration_ms': duration_ms,
+        },
+    )
+
+    if request.path != '/metrics':
+        status_code = str(response.status_code)
+        HTTP_REQUESTS_TOTAL.labels(
+            method=request.method,
+            endpoint=endpoint,
+            status_code=status_code,
+        ).inc()
+        HTTP_REQUEST_DURATION_SECONDS.labels(
+            method=request.method,
+            endpoint=endpoint,
+            status_code=status_code,
+        ).observe(duration_seconds)
+        HTTP_REQUESTS_IN_PROGRESS.labels(
+            method=request.method,
+            endpoint=endpoint,
+        ).dec()
+    return response
+
+
 @app.route('/')
 def index():
     """Main endpoint - service and system information."""
-    logger.info(
-        'Request: %s %s from %s',
-        request.method,
-        request.path,
-        request.remote_addr,
-    )
-
+    ENDPOINT_CALLS_TOTAL.labels(endpoint='/').inc()
     response = {
         'service': get_service_info(),
         'system': get_system_info(),
@@ -118,6 +301,11 @@ def index():
                 'method': 'GET',
                 'description': 'Health check',
             },
+            {
+                'path': '/metrics',
+                'method': 'GET',
+                'description': 'Prometheus metrics endpoint',
+            },
         ],
     }
 
@@ -127,12 +315,9 @@ def index():
 @app.route('/health')
 def health():
     """Health check endpoint for monitoring."""
+    ENDPOINT_CALLS_TOTAL.labels(endpoint='/health').inc()
     uptime = get_uptime()
-    timestamp = (
-        datetime.now(timezone.utc)
-        .isoformat()
-        .replace('+00:00', '.000Z')
-    )
+    timestamp = format_timestamp()
     return jsonify(
         {
             'status': 'healthy',
@@ -145,6 +330,15 @@ def health():
 @app.errorhandler(404)
 def not_found(error):
     """Handle 404 errors."""
+    logger.warning(
+        'not_found',
+        extra={
+            'method': request.method,
+            'path': request.path,
+            'status_code': 404,
+            'client_ip': get_client_ip(),
+        },
+    )
     return jsonify(
         {'error': 'Not Found', 'message': 'Endpoint does not exist'},
     ), 404
@@ -153,7 +347,15 @@ def not_found(error):
 @app.errorhandler(500)
 def internal_error(error):
     """Handle 500 errors."""
-    logger.error('Internal server error: %s', error)
+    logger.exception(
+        'internal_server_error',
+        extra={
+            'method': request.method,
+            'path': request.path,
+            'status_code': 500,
+            'client_ip': get_client_ip(),
+        },
+    )
     return jsonify(
         {
             'error': 'Internal Server Error',
@@ -162,7 +364,26 @@ def internal_error(error):
     ), 500
 
 
+@app.route('/boom')
+def boom():
+    ENDPOINT_CALLS_TOTAL.labels(endpoint='/boom').inc()
+    raise RuntimeError("synthetic lab error")
+
+
+@app.route('/metrics')
+def metrics() -> Response:
+    """Expose Prometheus metrics for scraping."""
+    return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
+
+
 if __name__ == '__main__':
-    logger.info('Application starting...')
-    logger.info(f'Starting server on {HOST}:{PORT}')
+    logger.info(
+        'application_starting',
+        extra={
+            'host': HOST,
+            'port': PORT,
+            'debug': DEBUG,
+            'started_at': format_timestamp(START_TIME),
+        },
+    )
     app.run(host=HOST, port=PORT, debug=DEBUG)
